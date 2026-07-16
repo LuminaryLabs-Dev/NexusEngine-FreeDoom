@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#080808">
+  <title>NexusEngine FreeDoom</title>
+  <style>
+    :root { color-scheme: dark; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #080808; color: #eee; }
+    body { display: grid; place-items: center; }
+    #app { width: 100%; height: 100%; display: grid; grid-template-rows: auto 1fr auto; }
+    header, footer { min-height: 42px; display: flex; align-items: center; gap: 16px; padding: 8px 14px; background: #111; border-color: #2b2b2b; }
+    header { border-bottom: 1px solid #2b2b2b; }
+    footer { border-top: 1px solid #2b2b2b; color: #aaa; font-size: 12px; justify-content: space-between; }
+    h1 { margin: 0; font-size: 14px; letter-spacing: .08em; text-transform: uppercase; }
+    #stage { min-height: 0; display: grid; place-items: center; position: relative; background: #000; }
+    canvas.emscripten { display: none; outline: none; image-rendering: pixelated; max-width: 100%; max-height: 100%; width: auto; height: auto; }
+    textarea.emscripten { position: absolute; inset: 12px; width: calc(100% - 24px); height: calc(100% - 24px); resize: none; border: 1px solid #333; background: #050505; color: #bbb; padding: 12px; display: none; }
+    #loading { text-align: center; width: min(520px, calc(100% - 32px)); }
+    #status { margin: 12px 0; min-height: 20px; }
+    progress { width: 100%; height: 12px; accent-color: #b7372f; }
+    button { appearance: none; border: 1px solid #555; background: #202020; color: #fff; padding: 7px 12px; cursor: pointer; font: inherit; }
+    button:hover { background: #303030; }
+    .hint { color: #888; }
+    @media (max-width: 680px) { footer .hint { display: none; } }
+  </style>
+</head>
+<body>
+  <main id="app">
+    <header><h1>NexusEngine FreeDoom</h1><span id="runtime-state">booting</span></header>
+    <section id="stage">
+      <div id="loading"><strong>Preparing open-source runtime</strong><div id="status">Downloading…</div><progress id="progress" value="0" max="100" hidden></progress></div>
+      <textarea class="emscripten" id="output" readonly aria-label="Runtime console"></textarea>
+      <canvas class="emscripten" id="canvas" tabindex="0" oncontextmenu="event.preventDefault()" aria-label="FreeDoom game"></canvas>
+    </section>
+    <footer><span>Click the game to capture the mouse · Esc releases it</span><span class="hint">Arrows/WASD move · Ctrl fires · Space uses · Esc menu</span><button id="fullscreen" type="button">Fullscreen</button></footer>
+  </main>
+
+  <script type="module">
+    const state = document.getElementById('runtime-state');
+    try {
+      const nexus = await import('https://cdn.jsdelivr.net/gh/LuminaryLabs-Dev/NexusEngine@c5548de504072bf09eb68986b98aca0292903803/src/index.js');
+      window.NexusFreeDoom = { nexus, phase: 'runtime-loading', startedAt: performance.now() };
+      state.textContent = 'nexus ready';
+      window.dispatchEvent(new CustomEvent('nexus:freedoom:ready'));
+    } catch (error) {
+      console.warn('NexusEngine bridge unavailable; Doom runtime can still start.', error);
+      window.NexusFreeDoom = { nexus: null, phase: 'runtime-loading', startedAt: performance.now(), bridgeError: String(error) };
+      state.textContent = 'runtime only';
+    }
+  </script>
+
+  <script>
+    const statusElement = document.getElementById('status');
+    const progressElement = document.getElementById('progress');
+    const loadingElement = document.getElementById('loading');
+    const canvasElement = document.getElementById('canvas');
+    const outputElement = document.getElementById('output');
+    const runtimeStateElement = document.getElementById('runtime-state');
+
+    document.getElementById('fullscreen').addEventListener('click', async () => {
+      try { await document.documentElement.requestFullscreen(); canvasElement.focus(); } catch (error) { console.warn(error); }
+    });
+
+    function fitCanvas() {
+      const stage = document.getElementById('stage');
+      if (!canvasElement.width || !canvasElement.height) return;
+      const scale = Math.min(stage.clientWidth / canvasElement.width, stage.clientHeight / canvasElement.height);
+      canvasElement.style.width = Math.max(1, Math.floor(canvasElement.width * scale)) + 'px';
+      canvasElement.style.height = Math.max(1, Math.floor(canvasElement.height * scale)) + 'px';
+    }
+    window.addEventListener('resize', fitCanvas);
+
+    var Module = {
+      _canLockPointer: true,
+      arguments: ['-iwad', '/freedoom2.wad', '-nomousegrab'],
+      print: (() => {
+        outputElement.value = '';
+        return (...args) => {
+          const text = args.join(' ');
+          console.log(text);
+          outputElement.value += text + '\n';
+          outputElement.scrollTop = outputElement.scrollHeight;
+        };
+      })(),
+      canvas: canvasElement,
+      setStatus(text) {
+        const match = text.match(/([^(]+)\((\d+(?:\.\d+)?)\/(\d+)\)/);
+        if (match) {
+          statusElement.textContent = match[1].trim();
+          progressElement.value = Number(match[2]);
+          progressElement.max = Number(match[3]);
+          progressElement.hidden = false;
+        } else {
+          statusElement.textContent = text;
+          progressElement.hidden = !text;
+        }
+      },
+      hideConsole() {
+        outputElement.style.display = 'none';
+        loadingElement.style.display = 'none';
+        canvasElement.style.display = 'block';
+        runtimeStateElement.textContent = 'playing';
+        fitCanvas();
+        canvasElement.focus();
+        if (window.NexusFreeDoom) window.NexusFreeDoom.phase = 'running';
+        window.dispatchEvent(new CustomEvent('nexus:freedoom:first-frame'));
+      },
+      showConsole() {
+        canvasElement.style.display = 'none';
+        loadingElement.style.display = 'none';
+        outputElement.style.display = 'block';
+      },
+      winResized: fitCanvas,
+      captureMouse() {
+        if (document.pointerLockElement !== canvasElement) canvasElement.requestPointerLock?.();
+      },
+      totalDependencies: 0,
+      monitorRunDependencies(left) {
+        Module.totalDependencies = Math.max(Module.totalDependencies, left);
+        Module.setStatus(left ? `Preparing… (${Module.totalDependencies-left}/${Module.totalDependencies})` : 'Starting FreeDoom…');
+      },
+      onRuntimeInitialized() {
+        runtimeStateElement.textContent = 'runtime ready';
+        if (window.NexusFreeDoom) window.NexusFreeDoom.phase = 'runtime-ready';
+      },
+      softExit(status) {
+        runtimeStateElement.textContent = `stopped (${status})`;
+      }
+    };
+
+    Module.setStatus('Downloading…');
+    window.onerror = (message) => {
+      Module.setStatus('Runtime failed. Open the browser console for details.');
+      runtimeStateElement.textContent = 'failed';
+      console.error(message);
+    };
+  </script>
+  {{{ SCRIPT }}}
+</body>
+</html>
