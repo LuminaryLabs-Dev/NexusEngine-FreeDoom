@@ -57,18 +57,18 @@ jobs:
         run: |
           emcmake cmake \
             -S vendor/Dwasm \
-            -B build \
+            -B vendor/Dwasm/build \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_GL=OFF \
             -DBUILD_SERVER=OFF \
             -DSINGLE_HTML_FILE=ON
-          cmake --build build --target index --parallel 2
+          cmake --build vendor/Dwasm/build --target index --parallel 2
 
       - name: Assemble Pages site
         run: |
           mkdir -p dist/licenses
-          cp build/index.html dist/index.html
+          cp vendor/Dwasm/build/index.html dist/index.html
           touch dist/.nojekyll
           cp vendor/Dwasm/COPYING dist/licenses/DWASM-GPL-2.0.txt
           FREEDOOM_LICENSE="$(find freedoom-release -maxdepth 3 -type f \( -iname copying -o -iname copying.txt -o -iname license -o -iname license.txt \) -print -quit)"
