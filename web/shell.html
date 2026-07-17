@@ -44,14 +44,27 @@
     console.info('Importing pinned NexusEngine module…');
     try {
       const nexus = await import('https://cdn.jsdelivr.net/gh/LuminaryLabs-Dev/NexusEngine@c5548de504072bf09eb68986b98aca0292903803/src/index.js');
-      window.NexusFreeDoom = { nexus, phase: 'runtime-loading', startedAt: performance.now() };
-      state.textContent = 'nexus ready';
-      console.info('NexusEngine bridge ready.', { exports: Object.keys(nexus).length });
+      const current = window.NexusFreeDoom || {};
+      window.NexusFreeDoom = {
+        ...current,
+        nexus,
+        phase: current.phase || 'runtime-loading',
+        startedAt: current.startedAt ?? performance.now()
+      };
+      if (window.NexusFreeDoom.phase !== 'running') state.textContent = 'nexus ready';
+      console.info('NexusEngine bridge ready.', { exports: Object.keys(nexus).length, phase: window.NexusFreeDoom.phase });
       window.dispatchEvent(new CustomEvent('nexus:freedoom:ready'));
     } catch (error) {
+      const current = window.NexusFreeDoom || {};
+      window.NexusFreeDoom = {
+        ...current,
+        nexus: null,
+        phase: current.phase || 'runtime-loading',
+        startedAt: current.startedAt ?? performance.now(),
+        bridgeError: String(error)
+      };
+      if (window.NexusFreeDoom.phase !== 'running') state.textContent = 'runtime only';
       console.warn('NexusEngine bridge unavailable; Doom runtime can still start.', error);
-      window.NexusFreeDoom = { nexus: null, phase: 'runtime-loading', startedAt: performance.now(), bridgeError: String(error) };
-      state.textContent = 'runtime only';
     }
     console.groupEnd();
   </script>
@@ -65,6 +78,12 @@
     const runtimeStateElement = document.getElementById('runtime-state');
     const bootStartedAt = performance.now();
     let lastStatus = '';
+
+    window.NexusFreeDoom = {
+      ...(window.NexusFreeDoom || {}),
+      phase: window.NexusFreeDoom?.phase || 'runtime-loading',
+      startedAt: window.NexusFreeDoom?.startedAt ?? bootStartedAt
+    };
 
     function runtimeLog(level, event, details) {
       const elapsed = (performance.now() - bootStartedAt).toFixed(1).padStart(8);
@@ -89,7 +108,7 @@
       }
     }
 
-    function inspectRuntimeFilesystem() {
+    function inspectRuntimeFilesystem({ enforceRequired = false } = {}) {
       const paths = ['/', '/freedoom2.wad', '/prboomx.wad', '/dwasm', '/dwasm/prboomx.cfg', '/defaults/prboomx.cfg'];
       const report = paths.map(describePath);
       let rootEntries = [];
@@ -98,14 +117,24 @@
       console.table(report);
       console.info('[NexusFreeDoom] Root entries:', rootEntries);
       const missingRequired = report.filter(entry => ['/freedoom2.wad', '/prboomx.wad'].includes(entry.path) && !entry.exists);
-      if (missingRequired.length) {
-        console.error('[NexusFreeDoom] Required runtime files are missing.', {
+      if (missingRequired.length && enforceRequired) {
+        console.error('[NexusFreeDoom] Required runtime files are missing after filesystem initialization.', {
           missing: missingRequired.map(entry => entry.path),
           expected: ['/freedoom2.wad', '/prboomx.wad'],
           rootEntries
         });
+      } else if (missingRequired.length) {
+        console.debug('[NexusFreeDoom] Embedded files are not mounted yet; waiting for runtime initialization.', {
+          missing: missingRequired.map(entry => entry.path)
+        });
+      } else {
+        console.info('[NexusFreeDoom] Required runtime files are mounted.', {
+          freedoom2: report.find(entry => entry.path === '/freedoom2.wad')?.size,
+          prboomx: report.find(entry => entry.path === '/prboomx.wad')?.size
+        });
       }
       console.groupEnd();
+      return { report, rootEntries, missingRequired };
     }
 
     runtimeLog('info', 'Browser environment', {
@@ -162,8 +191,7 @@
       _canLockPointer: true,
       arguments: ['-iwad', '/freedoom2.wad', '-nomousegrab'],
       preRun: [() => {
-        runtimeLog('info', 'Emscripten preRun entered', { arguments: Module.arguments });
-        inspectRuntimeFilesystem();
+        runtimeLog('info', 'Emscripten preRun entered; embedded data may still be mounting', { arguments: Module.arguments });
       }],
       postRun: [() => runtimeLog('info', 'Emscripten postRun completed')],
       print: (...args) => {
@@ -202,7 +230,11 @@
         runtimeStateElement.textContent = 'playing';
         fitCanvas();
         canvasElement.focus();
-        if (window.NexusFreeDoom) window.NexusFreeDoom.phase = 'running';
+        window.NexusFreeDoom = {
+          ...(window.NexusFreeDoom || {}),
+          phase: 'running',
+          startedAt: window.NexusFreeDoom?.startedAt ?? bootStartedAt
+        };
         window.dispatchEvent(new CustomEvent('nexus:freedoom:first-frame'));
       },
       showConsole() {
@@ -231,19 +263,25 @@
           elapsedMs: Math.round(performance.now() - bootStartedAt),
           memoryBytes: Module.HEAP8?.buffer?.byteLength ?? 'unknown'
         });
-        inspectRuntimeFilesystem();
+        inspectRuntimeFilesystem({ enforceRequired: true });
         runtimeStateElement.textContent = 'runtime ready';
-        if (window.NexusFreeDoom) window.NexusFreeDoom.phase = 'runtime-ready';
+        window.NexusFreeDoom = {
+          ...(window.NexusFreeDoom || {}),
+          phase: 'runtime-ready',
+          startedAt: window.NexusFreeDoom?.startedAt ?? bootStartedAt
+        };
       },
       onAbort(reason) {
         runtimeLog('error', 'WebAssembly runtime aborted', { reason, arguments: Module.arguments });
         runtimeStateElement.textContent = 'aborted';
+        window.NexusFreeDoom = { ...(window.NexusFreeDoom || {}), phase: 'aborted', abortReason: String(reason || '') };
         Module.setStatus(`Runtime aborted: ${reason || 'unknown reason'}`);
-        try { inspectRuntimeFilesystem(); } catch (error) { runtimeLog('error', 'Post-abort filesystem inspection failed', error); }
+        try { inspectRuntimeFilesystem({ enforceRequired: true }); } catch (error) { runtimeLog('error', 'Post-abort filesystem inspection failed', error); }
       },
       softExit(status) {
         runtimeLog(status === 0 ? 'info' : 'error', 'Runtime exited', { status });
         runtimeStateElement.textContent = `stopped (${status})`;
+        window.NexusFreeDoom = { ...(window.NexusFreeDoom || {}), phase: 'stopped', exitStatus: status };
       }
     };
 
@@ -261,6 +299,7 @@
       });
       Module.setStatus('Runtime failed. Open the browser console for details.');
       runtimeStateElement.textContent = 'failed';
+      window.NexusFreeDoom = { ...(window.NexusFreeDoom || {}), phase: 'failed' };
     });
 
     window.addEventListener('unhandledrejection', event => {
