@@ -40,16 +40,20 @@
 
   <script type="module">
     const state = document.getElementById('runtime-state');
+    console.group('[NexusFreeDoom] NexusEngine bridge');
+    console.info('Importing pinned NexusEngine module…');
     try {
       const nexus = await import('https://cdn.jsdelivr.net/gh/LuminaryLabs-Dev/NexusEngine@c5548de504072bf09eb68986b98aca0292903803/src/index.js');
       window.NexusFreeDoom = { nexus, phase: 'runtime-loading', startedAt: performance.now() };
       state.textContent = 'nexus ready';
+      console.info('NexusEngine bridge ready.', { exports: Object.keys(nexus).length });
       window.dispatchEvent(new CustomEvent('nexus:freedoom:ready'));
     } catch (error) {
       console.warn('NexusEngine bridge unavailable; Doom runtime can still start.', error);
       window.NexusFreeDoom = { nexus: null, phase: 'runtime-loading', startedAt: performance.now(), bridgeError: String(error) };
       state.textContent = 'runtime only';
     }
+    console.groupEnd();
   </script>
 
   <script>
@@ -59,34 +63,123 @@
     const canvasElement = document.getElementById('canvas');
     const outputElement = document.getElementById('output');
     const runtimeStateElement = document.getElementById('runtime-state');
+    const bootStartedAt = performance.now();
+    let lastStatus = '';
+
+    function runtimeLog(level, event, details) {
+      const elapsed = (performance.now() - bootStartedAt).toFixed(1).padStart(8);
+      const prefix = `[NexusFreeDoom +${elapsed}ms] ${event}`;
+      const writer = console[level] || console.log;
+      details === undefined ? writer(prefix) : writer(prefix, details);
+    }
+
+    function appendRuntimeOutput(level, args) {
+      const text = args.map(value => typeof value === 'string' ? value : String(value)).join(' ');
+      outputElement.value += `[${level}] ${text}\n`;
+      outputElement.scrollTop = outputElement.scrollHeight;
+      return text;
+    }
+
+    function describePath(path) {
+      try {
+        const stat = FS.stat(path);
+        return { path, exists: true, size: stat.size, mode: stat.mode, directory: FS.isDir(stat.mode) };
+      } catch (error) {
+        return { path, exists: false, error: String(error) };
+      }
+    }
+
+    function inspectRuntimeFilesystem() {
+      const paths = ['/', '/freedoom2.wad', '/prboomx.wad', '/dwasm', '/dwasm/prboomx.cfg', '/defaults/prboomx.cfg'];
+      const report = paths.map(describePath);
+      let rootEntries = [];
+      try { rootEntries = FS.readdir('/'); } catch (error) { rootEntries = [`<unable to read: ${error}>`]; }
+      runtimeLog('group', 'Virtual filesystem inspection');
+      console.table(report);
+      console.info('[NexusFreeDoom] Root entries:', rootEntries);
+      const missingRequired = report.filter(entry => ['/freedoom2.wad', '/prboomx.wad'].includes(entry.path) && !entry.exists);
+      if (missingRequired.length) {
+        console.error('[NexusFreeDoom] Required runtime files are missing.', {
+          missing: missingRequired.map(entry => entry.path),
+          expected: ['/freedoom2.wad', '/prboomx.wad'],
+          rootEntries
+        });
+      }
+      console.groupEnd();
+    }
+
+    runtimeLog('info', 'Browser environment', {
+      href: location.href,
+      userAgent: navigator.userAgent,
+      language: navigator.language,
+      online: navigator.onLine,
+      crossOriginIsolated: window.crossOriginIsolated,
+      hardwareConcurrency: navigator.hardwareConcurrency,
+      deviceMemory: navigator.deviceMemory ?? 'unknown',
+      viewport: `${innerWidth}x${innerHeight}`,
+      devicePixelRatio
+    });
 
     document.getElementById('fullscreen').addEventListener('click', async () => {
-      try { await document.documentElement.requestFullscreen(); canvasElement.focus(); } catch (error) { console.warn(error); }
+      runtimeLog('info', 'Fullscreen requested');
+      try {
+        await document.documentElement.requestFullscreen();
+        canvasElement.focus();
+        runtimeLog('info', 'Fullscreen entered');
+      } catch (error) {
+        runtimeLog('error', 'Fullscreen request failed', error);
+      }
     });
+
+    document.addEventListener('fullscreenchange', () => runtimeLog('info', 'Fullscreen state changed', { active: Boolean(document.fullscreenElement) }));
+    document.addEventListener('pointerlockchange', () => runtimeLog('info', 'Pointer-lock state changed', { active: document.pointerLockElement === canvasElement }));
+    document.addEventListener('pointerlockerror', event => runtimeLog('error', 'Pointer-lock failed', event));
+    window.addEventListener('online', () => runtimeLog('info', 'Network became online'));
+    window.addEventListener('offline', () => runtimeLog('warn', 'Network became offline'));
+
+    canvasElement.addEventListener('webglcontextlost', event => {
+      event.preventDefault();
+      runtimeLog('error', 'WebGL context lost');
+    });
+    canvasElement.addEventListener('webglcontextrestored', () => runtimeLog('info', 'WebGL context restored'));
 
     function fitCanvas() {
       const stage = document.getElementById('stage');
-      if (!canvasElement.width || !canvasElement.height) return;
+      if (!canvasElement.width || !canvasElement.height) {
+        runtimeLog('debug', 'Canvas fit skipped; runtime has not set dimensions yet');
+        return;
+      }
       const scale = Math.min(stage.clientWidth / canvasElement.width, stage.clientHeight / canvasElement.height);
-      canvasElement.style.width = Math.max(1, Math.floor(canvasElement.width * scale)) + 'px';
-      canvasElement.style.height = Math.max(1, Math.floor(canvasElement.height * scale)) + 'px';
+      const width = Math.max(1, Math.floor(canvasElement.width * scale));
+      const height = Math.max(1, Math.floor(canvasElement.height * scale));
+      canvasElement.style.width = width + 'px';
+      canvasElement.style.height = height + 'px';
+      runtimeLog('debug', 'Canvas fitted', { source: `${canvasElement.width}x${canvasElement.height}`, display: `${width}x${height}`, scale });
     }
     window.addEventListener('resize', fitCanvas);
 
     var Module = {
       _canLockPointer: true,
       arguments: ['-iwad', '/freedoom2.wad', '-nomousegrab'],
-      print: (() => {
-        outputElement.value = '';
-        return (...args) => {
-          const text = args.join(' ');
-          console.log(text);
-          outputElement.value += text + '\n';
-          outputElement.scrollTop = outputElement.scrollHeight;
-        };
-      })(),
+      preRun: [() => {
+        runtimeLog('info', 'Emscripten preRun entered', { arguments: Module.arguments });
+        inspectRuntimeFilesystem();
+      }],
+      postRun: [() => runtimeLog('info', 'Emscripten postRun completed')],
+      print: (...args) => {
+        const text = appendRuntimeOutput('stdout', args);
+        console.log('[FreeDoom stdout]', text);
+      },
+      printErr: (...args) => {
+        const text = appendRuntimeOutput('stderr', args);
+        console.error('[FreeDoom stderr]', text);
+      },
       canvas: canvasElement,
       setStatus(text) {
+        if (text !== lastStatus) {
+          runtimeLog('info', 'Runtime status changed', { previous: lastStatus, next: text });
+          lastStatus = text;
+        }
         const match = text.match(/([^(]+)\((\d+(?:\.\d+)?)\/(\d+)\)/);
         if (match) {
           statusElement.textContent = match[1].trim();
@@ -99,6 +192,10 @@
         }
       },
       hideConsole() {
+        runtimeLog('info', 'First playable frame presented', {
+          canvas: `${canvasElement.width}x${canvasElement.height}`,
+          elapsedMs: Math.round(performance.now() - bootStartedAt)
+        });
         outputElement.style.display = 'none';
         loadingElement.style.display = 'none';
         canvasElement.style.display = 'block';
@@ -109,34 +206,66 @@
         window.dispatchEvent(new CustomEvent('nexus:freedoom:first-frame'));
       },
       showConsole() {
+        runtimeLog('warn', 'Runtime requested console presentation');
         canvasElement.style.display = 'none';
         loadingElement.style.display = 'none';
         outputElement.style.display = 'block';
       },
       winResized: fitCanvas,
       captureMouse() {
-        if (document.pointerLockElement !== canvasElement) canvasElement.requestPointerLock?.();
+        runtimeLog('debug', 'Runtime requested mouse capture');
+        if (document.pointerLockElement !== canvasElement) {
+          canvasElement.requestPointerLock?.().catch?.(error => runtimeLog('error', 'Mouse capture rejected', error));
+        }
       },
       totalDependencies: 0,
       monitorRunDependencies(left) {
         Module.totalDependencies = Math.max(Module.totalDependencies, left);
-        Module.setStatus(left ? `Preparing… (${Module.totalDependencies-left}/${Module.totalDependencies})` : 'Starting FreeDoom…');
+        const completed = Module.totalDependencies - left;
+        runtimeLog('debug', 'Run dependency count changed', { left, completed, total: Module.totalDependencies });
+        Module.setStatus(left ? `Preparing… (${completed}/${Module.totalDependencies})` : 'Starting FreeDoom…');
       },
       onRuntimeInitialized() {
+        runtimeLog('info', 'WebAssembly runtime initialized', {
+          arguments: Module.arguments,
+          elapsedMs: Math.round(performance.now() - bootStartedAt),
+          memoryBytes: Module.HEAP8?.buffer?.byteLength ?? 'unknown'
+        });
+        inspectRuntimeFilesystem();
         runtimeStateElement.textContent = 'runtime ready';
         if (window.NexusFreeDoom) window.NexusFreeDoom.phase = 'runtime-ready';
       },
+      onAbort(reason) {
+        runtimeLog('error', 'WebAssembly runtime aborted', { reason, arguments: Module.arguments });
+        runtimeStateElement.textContent = 'aborted';
+        Module.setStatus(`Runtime aborted: ${reason || 'unknown reason'}`);
+        try { inspectRuntimeFilesystem(); } catch (error) { runtimeLog('error', 'Post-abort filesystem inspection failed', error); }
+      },
       softExit(status) {
+        runtimeLog(status === 0 ? 'info' : 'error', 'Runtime exited', { status });
         runtimeStateElement.textContent = `stopped (${status})`;
       }
     };
 
+    outputElement.value = '';
+    runtimeLog('info', 'Emscripten module configured', { arguments: Module.arguments });
     Module.setStatus('Downloading…');
-    window.onerror = (message) => {
+
+    window.addEventListener('error', event => {
+      runtimeLog('error', 'Uncaught browser error', {
+        message: event.message,
+        filename: event.filename,
+        line: event.lineno,
+        column: event.colno,
+        error: event.error?.stack || String(event.error || '')
+      });
       Module.setStatus('Runtime failed. Open the browser console for details.');
       runtimeStateElement.textContent = 'failed';
-      console.error(message);
-    };
+    });
+
+    window.addEventListener('unhandledrejection', event => {
+      runtimeLog('error', 'Unhandled promise rejection', event.reason?.stack || event.reason);
+    });
   </script>
   {{{ SCRIPT }}}
 </body>
