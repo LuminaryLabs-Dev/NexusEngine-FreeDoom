@@ -20,8 +20,12 @@ const fatalPatterns = [
 ];
 
 (async () => {
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch({
+    headless: true,
+    args: ['--autoplay-policy=no-user-gesture-required']
+  });
   const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+  page.setDefaultTimeout(180_000);
 
   page.on('console', message => {
     const line = `[browser:${message.type()}] ${message.text()}`;
@@ -41,17 +45,45 @@ const fatalPatterns = [
 
   try {
     console.log(`[smoke] Opening ${targetUrl}`);
-    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 120_000 });
+    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 180_000 });
+
+    await page.waitForFunction(() => typeof FS !== 'undefined' && typeof FS.stat === 'function');
+
+    const filesystem = await page.evaluate(() => {
+      const inspect = path => {
+        try {
+          const stat = FS.stat(path);
+          const header = Array.from(FS.readFile(path).subarray(0, 4))
+            .map(code => String.fromCharCode(code))
+            .join('');
+          return { path, exists: true, size: stat.size, header };
+        } catch (error) {
+          return { path, exists: false, error: String(error) };
+        }
+      };
+
+      return {
+        rootEntries: FS.readdir('/'),
+        freedoom: inspect('/freedoom2.wad'),
+        support: inspect('/prboomx.wad')
+      };
+    });
+
+    console.log('[smoke] Filesystem:', JSON.stringify(filesystem, null, 2));
+
+    if (!filesystem.freedoom.exists || filesystem.freedoom.header !== 'IWAD' || filesystem.freedoom.size < 1_000_000) {
+      throw new Error(`Invalid /freedoom2.wad: ${JSON.stringify(filesystem.freedoom)}`);
+    }
+    if (!filesystem.support.exists || filesystem.support.header !== 'PWAD' || filesystem.support.size < 400_000) {
+      throw new Error(`Invalid /prboomx.wad: ${JSON.stringify(filesystem.support)}`);
+    }
 
     await page.waitForFunction(() => {
-      const state = document.getElementById('runtime-state')?.textContent?.trim();
-      const canvas = document.getElementById('canvas');
-      if (!canvas) return false;
-      const visible = getComputedStyle(canvas).display !== 'none';
-      return state === 'playing' && visible && canvas.width > 0 && canvas.height > 0;
-    }, null, { timeout: 120_000 });
+      const state = document.getElementById('runtime-state')?.textContent?.trim() || '';
+      return state === 'playing' || /^(stopped|failed|aborted)/.test(state);
+    });
 
-    await page.waitForTimeout(5_000);
+    await page.waitForTimeout(3_000);
 
     const snapshot = await page.evaluate(() => {
       const canvas = document.getElementById('canvas');
@@ -59,6 +91,7 @@ const fatalPatterns = [
         title: document.title,
         state: document.getElementById('runtime-state')?.textContent?.trim() || '',
         status: document.getElementById('status')?.textContent?.trim() || '',
+        output: document.getElementById('output')?.value || '',
         canvas: canvas ? {
           width: canvas.width,
           height: canvas.height,
@@ -72,7 +105,7 @@ const fatalPatterns = [
 
     console.log('[smoke] Final snapshot:', JSON.stringify(snapshot, null, 2));
 
-    const combined = [...consoleLines, ...pageErrors].join('\n');
+    const combined = [...consoleLines, ...pageErrors, snapshot.output].join('\n');
     const fatal = fatalPatterns.find(pattern => pattern.test(combined));
 
     if (fatal) throw new Error(`Fatal runtime pattern observed: ${fatal}`);
@@ -82,7 +115,7 @@ const fatalPatterns = [
       throw new Error(`Playable canvas is invalid: ${JSON.stringify(snapshot.canvas)}`);
     }
 
-    console.log('[smoke] PASS: FreeDoom reached a stable playable frame.');
+    console.log('[smoke] PASS: both WADs are mounted and FreeDoom reached a playable frame.');
   } catch (error) {
     console.error('[smoke] FAIL:', error.stack || String(error));
     console.error('[smoke] Captured browser output:\n' + consoleLines.join('\n'));
