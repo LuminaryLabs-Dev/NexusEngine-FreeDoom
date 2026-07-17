@@ -55,6 +55,17 @@ jobs:
       - name: Apply NexusEngine browser shell
         run: cp web/shell.html vendor/Dwasm/wasm/shell.html
 
+      - name: Normalize Dwasm Emscripten asset paths
+        run: |
+          sed -i \
+            -e 's#../../wasm/shell.html#../wasm/shell.html#g' \
+            -e 's#../../wasm/fs/#../wasm/fs/#g' \
+            vendor/Dwasm/CMakeLists.txt
+          grep -q -- '--shell-file ../wasm/shell.html' vendor/Dwasm/CMakeLists.txt
+          grep -q -- '--embed-file=../wasm/fs/@/' vendor/Dwasm/CMakeLists.txt
+          test -s vendor/Dwasm/wasm/shell.html
+          test -s vendor/Dwasm/wasm/fs/freedoom2.wad
+
       - name: Compile PrBoom runtime to WebAssembly
         run: |
           emcmake cmake \
