@@ -49,7 +49,7 @@ const fatalPatterns = [
       if (!canvas) return false;
       const visible = getComputedStyle(canvas).display !== 'none';
       return state === 'playing' && visible && canvas.width > 0 && canvas.height > 0;
-    }, { timeout: 120_000 });
+    }, null, { timeout: 120_000 });
 
     await page.waitForTimeout(5_000);
 
