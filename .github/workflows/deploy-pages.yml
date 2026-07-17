@@ -17,14 +17,20 @@ concurrency:
 env:
   DWASM_COMMIT: ddf0347a4fc115b11ffb1c5710768b7c47c46698
   FREEDOOM_VERSION: 0.13.0
+  PRBOOMX_WAD_SHA256: 506fe7159eaf0a6cb479f866131ec7653638bb08928029cb8dabe1b3b1c9474d
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Check out NexusEngine-FreeDoom
         uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
 
       - name: Install Emscripten
         uses: mymindstorm/setup-emsdk@v14
@@ -33,14 +39,17 @@ jobs:
           actions-cache-folder: emsdk-cache
 
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build unzip
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build unzip libsdl2-dev python3
 
-      - name: Fetch GPL Doom-compatible runtime source
+      - name: Fetch pinned GPL Doom-compatible runtime source
         run: |
           git clone https://github.com/GMH-Code/Dwasm.git vendor/Dwasm
           git -C vendor/Dwasm checkout "$DWASM_COMMIT"
+          test "$(git -C vendor/Dwasm rev-parse HEAD)" = "$DWASM_COMMIT"
 
-      - name: Fetch and mount FreeDoom Phase 2
+      - name: Fetch and verify FreeDoom Phase 2
         run: |
           curl --fail --location --retry 3 \
             "https://github.com/freedoom/freedoom/releases/download/v${FREEDOOM_VERSION}/freedoom-${FREEDOOM_VERSION}.zip" \
@@ -48,23 +57,62 @@ jobs:
           unzip -q freedoom.zip -d freedoom-release
           WAD_PATH="$(find freedoom-release -type f -name freedoom2.wad -print -quit)"
           test -n "$WAD_PATH"
+          test -s "$WAD_PATH"
+          test "$(head -c 4 "$WAD_PATH")" = "IWAD"
+          WAD_BYTES="$(stat -c %s "$WAD_PATH")"
+          test "$WAD_BYTES" -gt 1000000
           mkdir -p vendor/Dwasm/wasm/fs
           cp "$WAD_PATH" vendor/Dwasm/wasm/fs/freedoom2.wad
-          test -s vendor/Dwasm/wasm/fs/freedoom2.wad
+          echo "FreeDoom IWAD ready: $WAD_BYTES bytes"
+
+      - name: Build mandatory Dwasm support WAD natively
+        run: |
+          cmake \
+            -S vendor/Dwasm \
+            -B vendor/Dwasm/build-native \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_GL=OFF \
+            -DBUILD_SERVER=OFF \
+            -DWITH_IMAGE=OFF \
+            -DWITH_MIXER=OFF \
+            -DWITH_NET=OFF \
+            -DWITH_PCRE=OFF \
+            -DWITH_ZLIB=OFF \
+            -DWITH_MAD=OFF \
+            -DWITH_FLUIDSYNTH=OFF \
+            -DWITH_DUMB=OFF \
+            -DWITH_VORBISFILE=OFF \
+            -DWITH_PORTMIDI=OFF \
+            -DWITH_ALSA=OFF
+          cmake --build vendor/Dwasm/build-native --target prboomwad --parallel 2
+
+          SUPPORT_WAD="vendor/Dwasm/build-native/prboomx.wad"
+          test -s "$SUPPORT_WAD"
+          test "$(head -c 4 "$SUPPORT_WAD")" = "PWAD"
+          test "$(stat -c %s "$SUPPORT_WAD")" -eq 470223
+          echo "$PRBOOMX_WAD_SHA256  $SUPPORT_WAD" | sha256sum -c -
+          cp "$SUPPORT_WAD" vendor/Dwasm/wasm/fs/prboomx.wad
+          echo "Dwasm support WAD generated and verified."
 
       - name: Apply NexusEngine browser shell
         run: cp web/shell.html vendor/Dwasm/wasm/shell.html
 
-      - name: Normalize Dwasm Emscripten asset paths
+      - name: Normalize and validate embedded runtime assets
         run: |
           sed -i \
             -e 's#../../wasm/shell.html#../wasm/shell.html#g' \
             -e 's#../../wasm/fs/#../wasm/fs/#g' \
             vendor/Dwasm/CMakeLists.txt
+
           grep -q -- '--shell-file ../wasm/shell.html' vendor/Dwasm/CMakeLists.txt
           grep -q -- '--embed-file=../wasm/fs/@/' vendor/Dwasm/CMakeLists.txt
           test -s vendor/Dwasm/wasm/shell.html
           test -s vendor/Dwasm/wasm/fs/freedoom2.wad
+          test -s vendor/Dwasm/wasm/fs/prboomx.wad
+          test "$(head -c 4 vendor/Dwasm/wasm/fs/freedoom2.wad)" = "IWAD"
+          test "$(head -c 4 vendor/Dwasm/wasm/fs/prboomx.wad)" = "PWAD"
+          find vendor/Dwasm/wasm/fs -maxdepth 2 -type f -printf '%p %s bytes\n' | sort
 
       - name: Compile PrBoom runtime to WebAssembly
         run: |
@@ -93,19 +141,42 @@ jobs:
           printf '%s\n' \
             'Runtime source: https://github.com/GMH-Code/Dwasm' \
             "Runtime commit: $DWASM_COMMIT" \
+            "Runtime support WAD SHA-256: $PRBOOMX_WAD_SHA256" \
             'Content source: https://github.com/freedoom/freedoom' \
             "Content release: $FREEDOOM_VERSION" \
             > dist/licenses/SOURCES.txt
 
-      - name: Validate playable artifact
+      - name: Validate single-file playable artifact
         run: |
           test -s dist/index.html
           grep -q 'freedoom2.wad' dist/index.html
+          grep -q 'prboomx.wad' dist/index.html
           grep -q 'NexusEngine FreeDoom' dist/index.html
           grep -q 'WebAssembly' dist/index.html || grep -q 'wasmBinary' dist/index.html
           BYTES="$(wc -c < dist/index.html)"
-          test "$BYTES" -gt 1000000
-          echo "Built playable single-file artifact: $BYTES bytes"
+          test "$BYTES" -gt 10000000
+          echo "Built single-file runtime with both WADs: $BYTES bytes"
+
+      - name: Install Chromium smoke-test runtime
+        run: |
+          npm install --no-save --package-lock=false playwright@1.55.0
+          npx playwright install --with-deps chromium
+
+      - name: Boot FreeDoom in Chromium
+        run: |
+          python3 -m http.server 4173 --directory dist > /tmp/freedoom-http.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:4173/ > /dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
+          curl --fail --silent http://127.0.0.1:4173/ > /dev/null
+          node scripts/smoke-free-doom.cjs http://127.0.0.1:4173/
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
@@ -127,7 +198,7 @@ jobs:
         id: deployment
         uses: actions/deploy-pages@v4
 
-      - name: Verify live FreeDoom page
+      - name: Verify live FreeDoom artifact
         env:
           PAGE_URL: ${{ steps.deployment.outputs.page_url }}
         run: |
@@ -140,6 +211,8 @@ jobs:
             --output deployed.html
           test -s deployed.html
           grep -q 'NexusEngine FreeDoom' deployed.html
+          grep -q 'freedoom2.wad' deployed.html
+          grep -q 'prboomx.wad' deployed.html
           BYTES="$(wc -c < deployed.html)"
-          test "$BYTES" -gt 1000000
-          echo "Verified deployed playable page: $PAGE_URL ($BYTES bytes)"
+          test "$BYTES" -gt 10000000
+          echo "Verified deployed FreeDoom artifact: $PAGE_URL ($BYTES bytes)"
